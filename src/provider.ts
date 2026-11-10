@@ -107,19 +107,33 @@ function modelFromBody(body: string): string {
   }
 }
 
+/**
+ * `staticToken`: the credential is a `CLAUDE_CODE_OAUTH_TOKEN` setup-token.
+ * It is the only token there is, so it is used verbatim: consulting the
+ * account store would at best prompt for the Keychain and at worst re-sign
+ * the request with some unrelated stored account's token.
+ */
+export interface ClaudeRequestOptions {
+  readonly staticToken?: boolean
+}
+
 /** Prepare the native Anthropic request for Claude Code subscription billing. */
 export async function prepareClaudeRequest(
   request: Request,
   accessToken: string,
   source?: string,
+  options: ClaudeRequestOptions = {},
 ): Promise<Request> {
   const body = await request.clone().text()
   const modelID = modelFromBody(body)
-  const account = resolveAccount(source)
-  const credentials =
-    (await getCachedCredentials(account)) ??
-    (await getCredentialsWithBackoff({}, account))
-  const token = credentials?.accessToken ?? accessToken
+  let token = accessToken
+  if (!options.staticToken) {
+    const account = resolveAccount(source)
+    const credentials =
+      (await getCachedCredentials(account)) ??
+      (await getCredentialsWithBackoff({}, account))
+    token = credentials?.accessToken ?? accessToken
+  }
   if (!token)
     throw new Error(
       "Claude subscription credentials are unavailable. Run /connect in OpenCode 2.",
@@ -158,6 +172,7 @@ export async function finishClaudeResponse(
   initial: Response,
   source?: string,
   send: Fetch = fetch,
+  options: ClaudeRequestOptions = {},
 ): Promise<Response> {
   const modelID = modelFromBody(await request.clone().text())
   const account = resolveAccount(source)
@@ -189,7 +204,15 @@ export async function finishClaudeResponse(
 
   let response = initial
 
-  for (let attempt = 0; response.status === 401 && attempt < 2; attempt++) {
+  // A static env token has nothing to reload, refresh or rotate: a 401 means
+  // the token itself is bad and a 429 is a real quota limit, so surface both
+  // rather than swap in an unrelated account from the store.
+  const maxAuthRecovery = options.staticToken ? 0 : 2
+  for (
+    let attempt = 0;
+    response.status === 401 && attempt < maxAuthRecovery;
+    attempt++
+  ) {
     let candidate: ClaudeCredentials | null =
       reloadCredentialsFromSource(account)
     if (!candidate || candidate.accessToken === token)
@@ -200,7 +223,7 @@ export async function finishClaudeResponse(
     response = await sendWithToken(token)
   }
 
-  if (response.status === 429) {
+  if (!options.staticToken && response.status === 429) {
     const rotated = reloadCredentialsFromSource(account)
     if (rotated && rotated.accessToken !== token) {
       token = rotated.accessToken

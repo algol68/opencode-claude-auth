@@ -6,6 +6,13 @@ import {
   loadPersistedAccountSource,
   setActiveAccountSource,
 } from "./credentials.ts"
+import {
+  buildEnvTokenCredential,
+  ENV_OAUTH_TOKEN_VAR,
+  getEnvToken,
+  isEnvTokenCredential,
+  refreshEnvTokenCredential,
+} from "./env-token.ts"
 import { readAllClaudeAccounts } from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
 import {
@@ -23,6 +30,7 @@ import { finishClaudeResponse, prepareClaudeRequest } from "./provider.ts"
 
 export * from "./betas.ts"
 export * from "./credentials.ts"
+export * from "./env-token.ts"
 export * from "./oauth-method.ts"
 export * from "./provider.ts"
 export * from "./signing.ts"
@@ -53,11 +61,22 @@ export function injectClaudeIdentity(event: SessionRequest): void {
   event.system.unshift({ type: "text", text: SYSTEM_IDENTITY })
 }
 
-function oauth(accounts: ReturnType<typeof readAllClaudeAccounts>) {
+export function oauth(
+  accounts: ReturnType<typeof readAllClaudeAccounts>,
+  envToken: string | null = null,
+): IntegrationOAuthMethodRegistration {
   return {
     integrationID: INTEGRATION_ID,
-    method: oauthMethodDescriptor(accounts),
+    // No account chooser in env-token mode: there is exactly one token.
+    method: oauthMethodDescriptor(envToken ? [] : accounts),
     authorize: async (inputs) => {
+      if (envToken)
+        return {
+          mode: "auto" as const,
+          url: "",
+          instructions: `Using the token from ${ENV_OAUTH_TOKEN_VAR}. Unset it to import a Claude Code account instead.`,
+          callback: Promise.resolve(buildEnvTokenCredential(envToken)),
+        }
       const value = await authorizeOAuth(inputs, accounts, realOAuthDeps)
       return {
         mode: "auto" as const,
@@ -66,7 +85,13 @@ function oauth(accounts: ReturnType<typeof readAllClaudeAccounts>) {
         callback: Promise.resolve(value),
       }
     },
-    refresh: (value) => refreshOAuthCredential(value, realOAuthDeps),
+    // Dispatch on the stored credential, not on the current mode: a
+    // credential imported from the Keychain keeps refreshing normally even
+    // if the variable is set later, and vice versa.
+    refresh: async (value) =>
+      isEnvTokenCredential(value)
+        ? refreshEnvTokenCredential(value)
+        : refreshOAuthCredential(value, realOAuthDeps),
     label: (value) => labelOAuthCredential(value),
   } satisfies IntegrationOAuthMethodRegistration
 }
@@ -75,9 +100,16 @@ export const ClaudeAuthPlugin = Plugin.define({
   id: "griffinmartin.claude-auth",
   setup: async (ctx) => {
     initLogger()
+    // Read once at setup: switching modes mid-process would mix a static
+    // token with refresh state from the store, which is exactly what this
+    // mode exists to avoid.
+    const envToken = getEnvToken()
+    if (envToken) log("env_token_mode_enabled", { source: ENV_OAUTH_TOKEN_VAR })
     let accounts: ReturnType<typeof readAllClaudeAccounts> = []
     try {
-      accounts = readAllClaudeAccounts()
+      // In env-token mode the store is irrelevant; reading it would only
+      // risk a Keychain prompt or a spurious failure on a headless host.
+      if (!envToken) accounts = readAllClaudeAccounts()
     } catch (cause) {
       log("plugin_init_error", { cause: String(cause) })
     }
@@ -89,7 +121,7 @@ export const ClaudeAuthPlugin = Plugin.define({
       draft.update(INTEGRATION_ID, (integration) => {
         integration.name = "Anthropic"
       })
-      draft.method.update(oauth(accounts))
+      draft.method.update(oauth(accounts, envToken))
     })
 
     // The Anthropic integration keeps its built-in API-key method alongside
@@ -155,7 +187,10 @@ export const ClaudeAuthPlugin = Plugin.define({
 
     // OpenCode's native Anthropic provider owns prompt conversion and streaming.
     // These HTTP hooks apply only the Claude Code subscription wire contract.
-    const requests = new WeakMap<Request, { source?: string }>()
+    const requests = new WeakMap<
+      Request,
+      { source?: string; staticToken: boolean }
+    >()
     await ctx.session.hook("http.request", async (event) => {
       if (event.model.providerID !== PROVIDER_ID) return
       const connection = await ctx.integration.connection.active(INTEGRATION_ID)
@@ -172,12 +207,16 @@ export const ClaudeAuthPlugin = Plugin.define({
         typeof credential.metadata.source === "string"
           ? credential.metadata.source
           : undefined
+      const staticToken = isEnvTokenCredential(credential)
       event.request = await prepareClaudeRequest(
         event.request,
-        credential.access,
+        // Prefer the live variable over the stored copy so a token rotated
+        // in the environment takes effect without reconnecting.
+        staticToken ? (envToken ?? credential.access) : credential.access,
         source,
+        { staticToken },
       )
-      requests.set(event.request, { source })
+      requests.set(event.request, { source, staticToken })
     })
     await ctx.session.hook("http.response", async (event) => {
       const context = requests.get(event.request)
@@ -187,10 +226,14 @@ export const ClaudeAuthPlugin = Plugin.define({
         event.request,
         event.response,
         context.source,
+        fetch,
+        { staticToken: context.staticToken },
       )
     })
 
-    if (accounts.length === 0) {
+    if (envToken) {
+      log("plugin_init", { mode: "env_token" })
+    } else if (accounts.length === 0) {
       log("plugin_init_no_accounts", { reason: "no credentials found" })
     } else {
       log("plugin_init", {

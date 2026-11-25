@@ -1,5 +1,5 @@
 import { buildBillingHeaderValue } from "./signing.ts"
-import { config, getModelOverride } from "./model-config.ts"
+import { getCliVersion, getModelOverride } from "./model-config.ts"
 import { log } from "./logger.ts"
 
 const TOOL_PREFIX = "mcp_"
@@ -470,7 +470,7 @@ export function transformBody(
     const hasInputPromptCaching = hasPromptCaching(parsed)
 
     // --- Billing header: inject as system[0] (no cache_control) ---
-    const version = process.env.ANTHROPIC_CLI_VERSION ?? config.ccVersion
+    const version = getCliVersion()
     const entrypoint = process.env.CLAUDE_CODE_ENTRYPOINT ?? "sdk-cli"
     const billingHeader = buildBillingHeaderValue(
       (parsed.messages ?? []) as Array<{

@@ -16,6 +16,7 @@ import {
   isEnvTokenCredential,
   refreshEnvTokenCredential,
 } from "./env-token.ts"
+import { detectCliVersion } from "./cli-version.ts"
 import { readAllClaudeAccounts } from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
 import {
@@ -41,6 +42,7 @@ import {
 import { finishClaudeResponse, prepareClaudeRequest } from "./provider.ts"
 
 export * from "./betas.ts"
+export * from "./cli-version.ts"
 export * from "./credentials.ts"
 export * from "./env-token.ts"
 export * from "./model-catalog.ts"
@@ -113,6 +115,9 @@ export const ClaudeAuthPlugin = Plugin.define({
   id: "griffinmartin.claude-auth",
   setup: async (ctx) => {
     initLogger()
+    void detectCliVersion().catch((cause) =>
+      log("cli_version_detect_failed", { cause: String(cause) }),
+    )
     // Read once at setup: switching modes mid-process would mix a static
     // token with refresh state from the store, which is exactly what this
     // mode exists to avoid.

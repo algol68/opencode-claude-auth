@@ -20,10 +20,22 @@ import {
 } from "./credentials.ts"
 import { fetchWithRetry } from "./http.ts"
 import { log } from "./logger.ts"
-import { getUserAgent } from "./model-config.ts"
-import { transformBody, transformResponseStream } from "./transforms.ts"
+import {
+  getCliVersion,
+  getUserAgent,
+  noteRequiredCliVersion,
+} from "./model-config.ts"
+import {
+  transformBody,
+  transformResponseStream,
+} from "./transforms.ts"
 
 const sessionID = crypto.randomUUID()
+
+// The body as OpenCode sent it, before transformBody. The billing signature is
+// computed over the untransformed messages, so re-signing for a retry has to
+// start from here rather than from the transformed body.
+const originalBodies = new WeakMap<Request, string>()
 
 type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
@@ -138,7 +150,7 @@ export async function prepareClaudeRequest(
     throw new Error(
       "Claude subscription credentials are unavailable. Run /connect in OpenCode 2.",
     )
-  return new Request(buildRequestURL(request), {
+  const prepared = new Request(buildRequestURL(request), {
     method: request.method,
     headers: buildRequestHeaders(
       request,
@@ -150,6 +162,8 @@ export async function prepareClaudeRequest(
     body: transformBody(body),
     signal: request.signal,
   })
+  originalBodies.set(prepared, body)
+  return prepared
 }
 
 async function sendRequest(request: Request, send: Fetch): Promise<Response> {
@@ -241,6 +255,26 @@ export async function finishClaudeResponse(
     if (!beta) break
     addExcludedBeta(modelID, beta)
     response = await sendWithToken(token, getExcludedBetas(modelID))
+  }
+
+  // A model gated on a newer Claude Code than we claim: learn the minimum from
+  // the error, re-sign the body with it and retry once.
+  if (
+    response.status >= 400 &&
+    response.status < 500 &&
+    response.status !== 401 &&
+    response.status !== 429 &&
+    noteRequiredCliVersion(await response.clone().text())
+  ) {
+    log("cli_version_raised", { modelID, version: getCliVersion() })
+    const original = originalBodies.get(request)
+    if (original !== undefined) {
+      request = new Request(request, {
+        method: "POST",
+        body: transformBody(original),
+      })
+      response = await sendWithToken(token)
+    }
   }
 
   if (!response.ok)

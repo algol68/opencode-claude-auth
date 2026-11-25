@@ -65,9 +65,62 @@ export function getModelOverride(modelId: string): ModelOverride | null {
   return null
 }
 
+// The Claude Code version sent with every request. Anthropic gates new models
+// on a minimum client version, so a hardcoded value goes stale with each
+// release. The effective version is the highest of: the floor in `config`, the
+// installed `claude` CLI, and any minimum the API has demanded in an error.
+// ANTHROPIC_CLI_VERSION still overrides everything.
+let detectedVersion: string | null = null
+let requiredVersion: string | null = null
+
+const VERSION = /^\d+\.\d+\.\d+$/
+
+export function compareVersions(a: string, b: string): number {
+  const pa = a.split(".").map(Number)
+  const pb = b.split(".").map(Number)
+  for (let i = 0; i < 3; i++) if (pa[i] !== pb[i]) return pa[i] - pb[i]
+  return 0
+}
+
+const highest = (...versions: (string | null)[]): string =>
+  versions
+    .filter((v): v is string => !!v && VERSION.test(v))
+    .reduce((a, b) => (compareVersions(a, b) >= 0 ? a : b))
+
+export function getCliVersion(): string {
+  return (
+    process.env.ANTHROPIC_CLI_VERSION ??
+    highest(config.ccVersion, detectedVersion, requiredVersion)
+  )
+}
+
+export function setDetectedCliVersion(version: string | null): void {
+  detectedVersion = version && VERSION.test(version) ? version : null
+}
+
+const REQUIRED = /version (\d+\.\d+\.\d+) or newer is required/i
+
+/**
+ * Learn a minimum version from an API error such as "Claude Code 2.1.280 does
+ * not support this model; version 2.1.290 or newer is required". Returns true
+ * when the effective version went up, i.e. a retry can succeed.
+ */
+export function noteRequiredCliVersion(errorText: string): boolean {
+  const match = REQUIRED.exec(errorText)
+  if (!match || process.env.ANTHROPIC_CLI_VERSION) return false
+  const before = getCliVersion()
+  requiredVersion = highest(requiredVersion, match[1])
+  return compareVersions(getCliVersion(), before) > 0
+}
+
+export function resetCliVersionState(): void {
+  detectedVersion = null
+  requiredVersion = null
+}
+
 export function getUserAgent(): string {
   return (
     process.env.ANTHROPIC_USER_AGENT ??
-    `claude-cli/${process.env.ANTHROPIC_CLI_VERSION ?? config.ccVersion} (external, sdk-cli)`
+    `claude-cli/${getCliVersion()} (external, sdk-cli)`
   )
 }

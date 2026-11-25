@@ -1,7 +1,7 @@
 .PHONY: build test test-models lint fix format clean intercept intercept-all intercept-update validate-oauth validate-oauth-dry
 
 build:
-	pnpm run build
+	pnpm run compile
 
 test:
 	pnpm run test:isolated

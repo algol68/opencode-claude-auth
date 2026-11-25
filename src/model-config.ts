@@ -94,6 +94,23 @@ export function getCliVersion(): string {
   )
 }
 
+/** The installed Claude Code version, if one was found. */
+export function getInstalledCliVersion(): string | null {
+  return detectedVersion
+}
+
+/**
+ * When the API has demanded a newer Claude Code than the one installed, the
+ * version it demanded; otherwise null. The plugin works around the gap, but the
+ * user should still update so Claude Code itself can use the model.
+ */
+export function getOutdatedCliRequirement(): string | null {
+  if (!requiredVersion || process.env.ANTHROPIC_CLI_VERSION) return null
+  if (detectedVersion && compareVersions(detectedVersion, requiredVersion) >= 0)
+    return null
+  return requiredVersion
+}
+
 export function setDetectedCliVersion(version: string | null): void {
   detectedVersion = version && VERSION.test(version) ? version : null
 }

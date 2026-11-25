@@ -5,6 +5,7 @@ import {
   compareVersions,
   config,
   getCliVersion,
+  getOutdatedCliRequirement,
   getUserAgent,
   noteRequiredCliVersion,
   resetCliVersionState,
@@ -57,6 +58,30 @@ describe("effective Claude Code version", () => {
     } finally {
       delete process.env.ANTHROPIC_CLI_VERSION
     }
+  })
+})
+
+describe("outdated Claude Code notice", () => {
+  it("flags a demanded version newer than the installed CLI", () => {
+    setDetectedCliVersion("2.1.280")
+    assert.equal(getOutdatedCliRequirement(), null)
+    noteRequiredCliVersion(GATE_ERROR)
+    assert.equal(getOutdatedCliRequirement(), "9.9.290")
+  })
+
+  it("stays quiet when the installed CLI already satisfies it", () => {
+    setDetectedCliVersion("9.9.300")
+    noteRequiredCliVersion(GATE_ERROR)
+    assert.equal(getOutdatedCliRequirement(), null)
+  })
+
+  it("tells the user to run claude update", async () => {
+    const { outdatedCliMessage } = await import("./index.ts")
+    const text = outdatedCliMessage("claude-mythos-5-2", "2.1.290", "2.1.280")
+    assert.match(text, /claude-mythos-5-2 requires Claude Code 2\.1\.290/)
+    assert.match(text, /2\.1\.280 is installed/)
+    assert.match(text, /claude update/)
+    assert.match(outdatedCliMessage("m", "1.0.0", null), /not found/)
   })
 })
 

@@ -20,6 +20,10 @@ import { detectCliVersion } from "./cli-version.ts"
 import { readAllClaudeAccounts } from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
 import {
+  getInstalledCliVersion,
+  getOutdatedCliRequirement,
+} from "./model-config.ts"
+import {
   type CatalogModel,
   fetchCatalog,
   isStale,
@@ -68,6 +72,22 @@ export const IDENTITY_REQUEST_HOOKS = [
   "generate",
   "title",
 ] as const
+
+export function outdatedCliMessage(
+  modelID: string,
+  required: string,
+  installed: string | null,
+): string {
+  const have = installed
+    ? `Claude Code ${installed} is installed`
+    : "Claude Code was not found on this machine"
+  return (
+    `Claude Code update needed: ${modelID} requires Claude Code ${required} or newer, and ${have}. ` +
+    "opencode-claude-auth worked around it for this session, but please run `claude update` " +
+    "(or update the Claude desktop app) so Claude Code can use this model too. " +
+    "Agent: tell the user this."
+  )
+}
 
 /** Prepends the Claude Code identity to an Anthropic request, once. */
 export function injectClaudeIdentity(event: SessionRequest): void {
@@ -360,6 +380,7 @@ export const ClaudeAuthPlugin = Plugin.define({
       const context = requests.get(event.request)
       if (!context) return
       requests.delete(event.request)
+      const requiredBefore = getOutdatedCliRequirement()
       event.response = await finishClaudeResponse(
         event.request,
         event.response,
@@ -367,7 +388,32 @@ export const ClaudeAuthPlugin = Plugin.define({
         fetch,
         { staticToken: context.staticToken },
       )
+      // Only the request that hit the version gate names the right model;
+      // others (title, compaction) may finish first.
+      if (getOutdatedCliRequirement() !== requiredBefore)
+        await notifyOutdatedCli(event.sessionID, event.model.id)
     })
+
+    // The retry above keeps the session working, but Claude Code itself is
+    // still too old for the model. Tell the user once per required version.
+    const notifiedVersions = new Set<string>()
+    const notifyOutdatedCli = async (sessionID: string, modelID: string) => {
+      const required = getOutdatedCliRequirement()
+      if (!required || notifiedVersions.has(required)) return
+      notifiedVersions.add(required)
+      const text = outdatedCliMessage(modelID, required, getInstalledCliVersion())
+      log("cli_update_needed", { modelID, required })
+      try {
+        await ctx.session.synthetic({
+          sessionID,
+          text,
+          description: "claude-auth: update Claude Code",
+          resume: false,
+        })
+      } catch (cause) {
+        log("cli_update_notice_failed", { cause: String(cause) })
+      }
+    }
 
     if (envToken) {
       log("plugin_init", { mode: "env_token" })

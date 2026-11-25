@@ -56,6 +56,9 @@ export * from "./signing.ts"
 export * from "./transforms.ts"
 
 const PROVIDER_ID = Provider.ID.make("anthropic")
+// Tags this plugin's synthetic session notes so the TUI part can toast them;
+// a resume:false note otherwise stays unseen until the user's next turn.
+export const NOTICE_SOURCE = "claude-auth"
 const SYSTEM_IDENTITY =
   "You are Claude Code, Anthropic's official CLI for Claude."
 
@@ -307,6 +310,7 @@ export const ClaudeAuthPlugin = Plugin.define({
               sessionID,
               text,
               description: "claude-models",
+              metadata: { source: NOTICE_SOURCE, kind: "models" },
               resume: false,
             })
           },
@@ -408,6 +412,7 @@ export const ClaudeAuthPlugin = Plugin.define({
           sessionID,
           text,
           description: "claude-auth: update Claude Code",
+          metadata: { source: NOTICE_SOURCE, kind: "cli-update" },
           resume: false,
         })
       } catch (cause) {

@@ -2,6 +2,9 @@ import { Plugin, Provider } from "@opencode/plugin"
 import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/promise/integration"
 import type { SessionRequest } from "@opencode/plugin/promise/session"
 import {
+  getAccountBySource,
+  getActiveAccount,
+  getCachedCredentials,
   initAccounts,
   loadPersistedAccountSource,
   setActiveAccountSource,
@@ -15,6 +18,15 @@ import {
 } from "./env-token.ts"
 import { readAllClaudeAccounts } from "./keychain.ts"
 import { initLogger, log } from "./logger.ts"
+import {
+  type CatalogModel,
+  fetchCatalog,
+  isStale,
+  loadCatalog,
+  type ModelCatalog,
+  reconcileModels,
+  saveCatalog,
+} from "./model-catalog.ts"
 import {
   authorizeOAuth,
   CLAUDE_CODE_OAUTH_METADATA_KEY,
@@ -31,6 +43,7 @@ import { finishClaudeResponse, prepareClaudeRequest } from "./provider.ts"
 export * from "./betas.ts"
 export * from "./credentials.ts"
 export * from "./env-token.ts"
+export * from "./model-catalog.ts"
 export * from "./oauth-method.ts"
 export * from "./provider.ts"
 export * from "./signing.ts"
@@ -144,6 +157,9 @@ export const ClaudeAuthPlugin = Plugin.define({
     }
     await loadConnection()
 
+    let catalog: ModelCatalog | null = loadCatalog()
+    let lastReconcile: { added: string[]; removed: string[] } | null = null
+
     await ctx.provider.transform((provider) => {
       const anthropic = provider.get(PROVIDER_ID)
       if (!anthropic) return
@@ -151,12 +167,126 @@ export const ClaudeAuthPlugin = Plugin.define({
         info.name = "Anthropic"
         info.integrationID = INTEGRATION_ID
       })
+      // The catalog is the subscription account's own model list, so it only
+      // replaces the models.dev list when that account is the one in use.
+      if (subscription && catalog) {
+        const result = reconcileModels(
+          [...anthropic.models.values()] as unknown as CatalogModel[],
+          catalog,
+        )
+        for (const model of result.models) model.cost = []
+        provider.models.set(PROVIDER_ID, result.models as never)
+        lastReconcile = { added: result.added, removed: result.removed }
+        return
+      }
       for (const [modelID] of anthropic.models) {
         provider.models.update(PROVIDER_ID, modelID, (model) => {
           if (subscription) model.cost = []
         })
       }
     })
+
+    const catalogToken = async (): Promise<string | null> => {
+      const connection = await ctx.integration.connection.active(INTEGRATION_ID)
+      if (!connection) return null
+      const credential = await ctx.integration.connection.resolve(connection)
+      if (credential?.type !== "oauth" || credential.methodID !== METHOD_ID)
+        return null
+      if (isEnvTokenCredential(credential)) return envToken ?? credential.access
+      const source =
+        typeof credential.metadata?.source === "string"
+          ? credential.metadata.source
+          : undefined
+      const account = source ? getAccountBySource(source) : getActiveAccount()
+      return (await getCachedCredentials(account))?.accessToken ?? credential.access
+    }
+
+    // Every location loads its own plugin instance; the cache file is shared,
+    // so adopt a newer copy another instance wrote before going to the network.
+    const adoptNewerCatalog = async (): Promise<boolean> => {
+      const disk = loadCatalog()
+      if (!disk || disk.fetchedAt <= (catalog?.fetchedAt ?? 0)) return false
+      catalog = disk
+      await ctx.provider.reload()
+      return true
+    }
+
+    let inflight: Promise<string> | null = null
+    const refreshCatalog = (): Promise<string> =>
+      (inflight ??= (async () => {
+        try {
+          const token = await catalogToken()
+          if (!token)
+            return "No Claude subscription connection, so the model list was not refreshed."
+          const previous = new Set(catalog?.models.map((m) => m.id) ?? [])
+          const next = await fetchCatalog(token)
+          saveCatalog(next)
+          catalog = next
+          await ctx.provider.reload()
+          const ids = next.models.map((m) => m.id)
+          const newIDs = ids.filter((id) => !previous.has(id))
+          const goneIDs = [...previous].filter((id) => !ids.includes(id))
+          log("model_catalog_refreshed", {
+            count: ids.length,
+            added: newIDs,
+            removed: goneIDs,
+          })
+          const lines = [
+            `Claude models refreshed from the account (GET /v1/models): ${ids.length} models.`,
+          ]
+          if (previous.size > 0)
+            lines.push(
+              newIDs.length || goneIDs.length
+                ? `Since last refresh: added ${newIDs.join(", ") || "none"}; removed ${goneIDs.join(", ") || "none"}.`
+                : "No change since the last refresh.",
+            )
+          if (lastReconcile?.added.length)
+            lines.push(`Not in models.dev, added: ${lastReconcile.added.join(", ")}.`)
+          if (lastReconcile?.removed.length)
+            lines.push(
+              `In models.dev but not on this account, hidden: ${lastReconcile.removed.join(", ")}.`,
+            )
+          return lines.join("\n")
+        } finally {
+          inflight = null
+        }
+      })())
+
+    const refreshIfStale = async () => {
+      if (!subscription) return
+      try {
+        if (await adoptNewerCatalog()) return
+        if (isStale(catalog)) await refreshCatalog()
+      } catch (cause) {
+        log("model_catalog_refresh_failed", { cause: String(cause) })
+      }
+    }
+    void refreshIfStale()
+    const refreshTimer = setInterval(() => void refreshIfStale(), 60 * 60 * 1000)
+    refreshTimer.unref?.()
+
+    if (ctx.command?.transform)
+      await ctx.command.transform((draft) => {
+        draft.add({
+          name: "claude-models",
+          description:
+            "Refresh the Anthropic model list from your Claude account (/v1/models)",
+          execute: async ({ sessionID }) => {
+            let text: string
+            try {
+              text = await refreshCatalog()
+            } catch (cause) {
+              text = `Claude model refresh failed: ${String(cause)}`
+            }
+            await ctx.session.synthetic({
+              sessionID,
+              text,
+              description: "claude-models",
+              resume: false,
+            })
+          },
+        })
+      })
 
     // Re-evaluate when the user switches credentials so the provider follows
     // the active connection instead of whatever was selected at startup.
@@ -172,7 +302,10 @@ export const ClaudeAuthPlugin = Plugin.define({
         ) {
           const before: boolean = subscription
           await loadConnection()
-          if (subscription !== before) await ctx.provider.reload()
+          if (subscription !== before) {
+            await ctx.provider.reload()
+            void refreshIfStale()
+          }
         }
       }
     })().catch((cause) => {
@@ -244,6 +377,7 @@ export const ClaudeAuthPlugin = Plugin.define({
 
     return () => {
       watcher.abort()
+      clearInterval(refreshTimer)
     }
   },
 })
